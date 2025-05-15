@@ -53,5 +53,40 @@ int sys_sigpending(sigset_t __user *set) {
 }
 
 int sys_sigkill(int pid, int signo, int code) {
-    return 0;
+    // 1. 验证信号编号有效性（1~10）
+    if (signo <= 0 || signo >= 10) {
+        return -1;
+    }
+
+    // 2. 遍历进程表查找目标进程
+    struct proc *p;
+    for (int i = 0; i < NPROC; i++) {
+        p = pool[i];
+        // 3. 检查进程有效性（非UNUSED状态且PID匹配）
+        if (p->state != UNUSED && p->pid == pid) {
+            // 4. 特殊处理SIGKILL信号（不可阻塞/忽略）
+            if (signo == SIGKILL) {
+                setkilled(p, -10 - signo);  // 强制终止进程
+                return 0;
+            }
+
+            // 5. 检查信号是否被忽略
+            // if (p->signal.handlers[signo].sa_sigaction == SIG_IGN) {
+            //     return 0;
+            // }
+
+            // 6. 添加到pending信号集
+            sigaddset(&p->signal.sigpending, signo);
+
+            // 7. 唤醒睡眠中的进程（模拟wakeup行为）
+            if (p->state == SLEEPING) {
+                p->state = RUNNABLE;
+            }
+
+            return 0;
+        }
+    }
+
+    // 8. 未找到目标进程
+    return -1;
 }
