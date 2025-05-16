@@ -18,12 +18,14 @@ int siginit(struct proc *p) {
 int siginit_fork(struct proc *parent, struct proc *child) {
     // copy parent's sigactions and signal mask
     // but clear all pending signals
+    child->signal.sigpending = 0;
     return 0;
 }
 
 int siginit_exec(struct proc *p) {
     // inherit signal mask and pending signals.
     // but reset all sigactions (except ignored) to default.
+    if (1) {} //???
     return 0;
 }
 
