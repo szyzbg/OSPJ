@@ -57,6 +57,7 @@ int do_signal(void) {
     assert(!intr_get());
 
     struct proc *p = curr_proc();
+    acquire(&p->mm->lock);
     sigset_t pending = p->signal.sigpending;
     sigset_t blocked = p->signal.sigmask;
 
@@ -66,6 +67,7 @@ int do_signal(void) {
             // 1. 处理 SIGKILL 和 SIGSTOP（不可阻塞或忽略）
             if (signo == SIGKILL || signo == SIGSTOP) {
                 setkilled(p, -10 - signo);
+                release(&p->mm->lock);
                 return 0;
             }
 
@@ -85,78 +87,60 @@ int do_signal(void) {
         if (signo != SIGCHLD) {
             setkilled(p, -10 - signo);
         }
-    return 0;
+        release(&p->mm->lock);
+        return 0;
 }
 
             // 6. 自定义处理函数
-            if (act->sa_sigaction != SIG_IGN) {
-                // 用户栈地址
-                uint64 user_sp = p->trapframe->sp;
+if (act->sa_sigaction != SIG_IGN) {
+    struct trapframe *tf = p->trapframe;
+    uint64 user_sp = tf->sp;
 
-                // 分配空间：ucontext + siginfo + 对齐
-                user_sp -= sizeof(struct ucontext);
-                user_sp -= sizeof(siginfo_t);
-                user_sp &= ~0x7;  // 8字节对齐
+    // 分配空间：siginfo_t + ucontext，16字节对齐
+    user_sp -= sizeof(siginfo_t) + sizeof(struct ucontext);
+    user_sp &= ~0xf;
 
-                // 构造 siginfo
-                siginfo_t *si = (siginfo_t *)user_sp;
-                memset(si, 0, sizeof(siginfo_t));
-                si->si_signo = signo;
+    uint64 info_user = user_sp;
+    uint64 uc_user = info_user + sizeof(siginfo_t);
 
-                // 构造 ucontext
-                struct ucontext *uc = (struct ucontext *)(user_sp + sizeof(siginfo_t));
-                struct mcontext *mc = &uc->uc_mcontext;
+    // 构造内核中的结构体
+    siginfo_t kinfo = {0};
+    kinfo.si_signo = signo;
 
-                // 从 trapframe 复制寄存器状态到 mcontext
-                mc->regs[0] = p->trapframe->ra;  // ra = regs[0]
-                mc->regs[1] = p->trapframe->sp;  // sp = regs[1]
-                mc->regs[2] = p->trapframe->gp;  // gp = regs[2]
-                mc->regs[3] = p->trapframe->tp;  // tp = regs[3]
-                mc->regs[4] = p->trapframe->t0;  // t0 = regs[4]
-                mc->regs[5] = p->trapframe->t1;  // t1 = regs[5]
-                mc->regs[6] = p->trapframe->t2;  // t2 = regs[6]
-                mc->regs[7] = p->trapframe->s0;  // s0 = regs[7]
-                mc->regs[8] = p->trapframe->s1;  // s1 = regs[8]
-                mc->regs[9] = p->trapframe->a0;  // a0 = regs[9]
-                mc->regs[10] = p->trapframe->a1; // a1 = regs[10]
-                mc->regs[11] = p->trapframe->a2; // a2 = regs[11]
-                mc->regs[12] = p->trapframe->a3; // a3 = regs[12]
-                mc->regs[13] = p->trapframe->a4; // a4 = regs[13]
-                mc->regs[14] = p->trapframe->a5; // a5 = regs[14]
-                mc->regs[15] = p->trapframe->a6; // a6 = regs[15]
-                mc->regs[16] = p->trapframe->a7; // a7 = regs[16]
-                mc->regs[17] = p->trapframe->s2; // s2 = regs[17]
-                mc->regs[18] = p->trapframe->s3; // s3 = regs[18]
-                mc->regs[19] = p->trapframe->s4; // s4 = regs[19]
-                mc->regs[20] = p->trapframe->s5; // s5 = regs[20]
-                mc->regs[21] = p->trapframe->s6; // s6 = regs[21]
-                mc->regs[22] = p->trapframe->s7; // s7 = regs[22]
-                mc->regs[23] = p->trapframe->s8; // s8 = regs[23]
-                mc->regs[24] = p->trapframe->s9; // s9 = regs[24]
-                mc->regs[25] = p->trapframe->s10; // s10 = regs[25]
-                mc->regs[26] = p->trapframe->s11; // s11 = regs[26]
+    struct ucontext kuc = {0};
+    kuc.uc_sigmask = blocked;
+    kuc.uc_mcontext.epc = tf->epc;
 
-                mc->epc = p->trapframe->epc;  // 程序计数器
-
-                // 保存原始信号掩码
-                uc->uc_sigmask = blocked;
-
-                // 更新信号掩码（添加 sa_mask 和当前信号）
-                p->signal.sigmask |= (act->sa_mask | sigmask(signo));
-
-                // 设置陷阱帧参数
-                p->trapframe->a0 = signo;          // 第一个参数：signo
-                p->trapframe->a1 = (uint64)si;     // 第二个参数：siginfo
-                p->trapframe->a2 = (uint64)uc;     // 第三个参数：ucontext
-                p->trapframe->ra = (uint64)act->sa_restorer; // 返回地址设为 sigreturn stub
-                p->trapframe->epc = (uint64)act->sa_sigaction; // PC指向用户处理函数
-                p->trapframe->sp = user_sp;        // 调整用户栈指针
-
-                return 0;
-            }
-        }
+    // 复制寄存器（假设 RISC-V 有 31 个通用寄存器）
+    uint64 *regs = &tf->ra;
+    for (int i = 0; i < 31; i++) {
+        kuc.uc_mcontext.regs[i] = regs[i];
     }
 
+    // 使用 copy_to_user 安全复制到用户空间
+    if (copy_to_user(p->mm, info_user, (char *)&kinfo, sizeof(kinfo)) < 0 ||
+        copy_to_user(p->mm, uc_user, (char *)&kuc, sizeof(kuc)) < 0) {
+        setkilled(p, -2);  // 用户栈写入失败
+        release(&p->mm->lock);
+        return -1;
+    }
+
+    // 更新信号掩码
+    p->signal.sigmask |= act->sa_mask | sigmask(signo);
+
+    // 设置陷阱帧参数
+    tf->a0 = signo;
+    tf->a1 = info_user;
+    tf->a2 = uc_user;
+    tf->epc = (uint64)act->sa_sigaction;
+    tf->ra = (uint64)act->sa_restorer;
+    tf->sp = user_sp;
+    release(&p->mm->lock);
+    return 0;
+}
+        }
+    }
+    release(&p->mm->lock);
     return 0;
 }
 // syscall handlers:
@@ -206,68 +190,59 @@ int sys_sigaction(int signo, const sigaction_t __user *act, sigaction_t __user *
         k_act->sa_sigaction = user_act.sa_sigaction;
         k_act->sa_mask      = user_act.sa_mask;
         k_act->sa_restorer  = user_act.sa_restorer;
-        release(&p->mm->lock);
     }
+    release(&p->mm->lock);
 
     return 0;
 }
 
-int sys_sigreturn() {
+int sys_sigreturn(void) {
     struct proc *p = curr_proc();
+    acquire(&p->mm->lock);
     struct trapframe *tf = p->trapframe;
+    uint64 user_sp = tf->sp;
 
-    // 从 a0 寄存器获取用户传递的 ucontext 指针
-    struct ucontext *uc = (struct ucontext *)tf->a0;
+    // 计算保存的 siginfo_t 和 ucontext 的地址
+    uint64 info_user = user_sp;
+    uint64 uc_user = info_user + sizeof(siginfo_t);
 
-    // 从用户空间拷贝 ucontext 结构体到内核栈
-    if (copy_from_user(p->mm, (char *)&uc, (uint64)uc, sizeof(struct ucontext))) {
-        return -1; // 用户空间拷贝失败
+    // 从用户空间读取 ucontext
+    struct ucontext kuc;
+    if (copy_from_user(p->mm, (char *)&kuc, uc_user, sizeof(kuc)) < 0) {
+        // 用户空间访问失败，终止进程
+        setkilled(p, -2);
+        release(&p->mm->lock);
+        return -1;
     }
 
     // 恢复信号掩码
-    p->signal.sigmask = uc->uc_sigmask;
+    p->signal.sigmask = kuc.uc_sigmask;
 
-    // 恢复寄存器状态（对应 RISC-V 寄存器布局）
-    tf->ra = uc->uc_mcontext.regs[0];  // ra = regs[0]
-    tf->sp = uc->uc_mcontext.regs[1];  // sp = regs[1]
-    tf->gp = uc->uc_mcontext.regs[2];  // gp = regs[2]
-    tf->tp = uc->uc_mcontext.regs[3];  // tp = regs[3]
-    tf->t0 = uc->uc_mcontext.regs[4];  // t0 = regs[4]
-    tf->t1 = uc->uc_mcontext.regs[5];  // t1 = regs[5]
-    tf->t2 = uc->uc_mcontext.regs[6];  // t2 = regs[6]
-    tf->s0 = uc->uc_mcontext.regs[7];  // s0 = regs[7]
-    tf->s1 = uc->uc_mcontext.regs[8];  // s1 = regs[8]
-    tf->a0 = uc->uc_mcontext.regs[9];  // a0 = regs[9]
-    tf->a1 = uc->uc_mcontext.regs[10]; // a1 = regs[10]
-    tf->a2 = uc->uc_mcontext.regs[11]; // a2 = regs[11]
-    tf->a3 = uc->uc_mcontext.regs[12]; // a3 = regs[12]
-    tf->a4 = uc->uc_mcontext.regs[13]; // a4 = regs[13]
-    tf->a5 = uc->uc_mcontext.regs[14]; // a5 = regs[14]
-    tf->a6 = uc->uc_mcontext.regs[15]; // a6 = regs[15]
-    tf->a7 = uc->uc_mcontext.regs[16]; // a7 = regs[16]
-    tf->s2 = uc->uc_mcontext.regs[17]; // s2 = regs[17]
-    tf->s3 = uc->uc_mcontext.regs[18]; // s3 = regs[18]
-    tf->s4 = uc->uc_mcontext.regs[19]; // s4 = regs[19]
-    tf->s5 = uc->uc_mcontext.regs[20]; // s5 = regs[20]
-    tf->s6 = uc->uc_mcontext.regs[21]; // s6 = regs[21]
-    tf->s7 = uc->uc_mcontext.regs[22]; // s7 = regs[22]
-    tf->s8 = uc->uc_mcontext.regs[23]; // s8 = regs[23]
-    tf->s9 = uc->uc_mcontext.regs[24]; // s9 = regs[24]
-    tf->s10 = uc->uc_mcontext.regs[25]; // s10 = regs[25]
-    tf->s11 = uc->uc_mcontext.regs[26]; // s11 = regs[26]
-    tf->epc = uc->uc_mcontext.epc;     // 程序计数器
+    // 恢复程序计数器
+    tf->epc = kuc.uc_mcontext.epc;
 
+    // 恢复通用寄存器（x1 到 x31）
+    uint64 *regs = &tf->ra;
+    for (int i = 0; i < 31; i++) {
+        regs[i] = kuc.uc_mcontext.regs[i];
+    }
+
+    // 此时，sp 已经被恢复（regs[1] 是 x2/sp）
+
+    release(&p->mm->lock);
     return 0;
 }
 
 int sys_sigprocmask(int how, const sigset_t __user *set, sigset_t __user *oldset) {
     struct proc *p = curr_proc();
+    acquire(&p->mm->lock);
     sigset_t new_mask = 0;
     sigset_t *current_mask = &p->signal.sigmask;
 
     // 1. 保存旧的信号掩码（如果oldset非空）
     if (oldset) {
         if (copy_to_user(p->mm, (uint64)oldset, (char*)current_mask, sizeof(sigset_t))) {
+            release(&p->mm->lock);
             return -1;  // 用户空间拷贝失败
         }
     }
@@ -276,6 +251,7 @@ int sys_sigprocmask(int how, const sigset_t __user *set, sigset_t __user *oldset
     if (set) {
         // 从用户空间读取新掩码
         if (copy_from_user(p->mm, (char*)&new_mask, (uint64)set, sizeof(sigset_t))) {
+            release(&p->mm->lock);
             return -1;  // 用户空间拷贝失败
         }
 
@@ -294,24 +270,27 @@ int sys_sigprocmask(int how, const sigset_t __user *set, sigset_t __user *oldset
                 *current_mask = new_mask;
                 break;
             default:
+                release(&p->mm->lock);
                 return -1;  // 无效的 how 参数
         }
     }
-
+    release(&p->mm->lock);
     return 0;
 }
 
 int sys_sigpending(sigset_t __user *set) {
     struct proc *p = curr_proc();
+    acquire(&p->mm->lock);
 
     // 如果用户提供了 set 指针
     if (set) {
         // 将当前进程的 sigpending 信号集复制到用户空间
         if (copy_to_user(p->mm, (uint64)set, (char*)&p->signal.sigpending, sizeof(sigset_t))) {
+            release(&p->mm->lock);
             return -1;  // 用户空间拷贝失败
         }
     }
-
+    release(&p->mm->lock);
     return 0;
 }
 
